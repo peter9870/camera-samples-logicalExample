@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-package com.example.android.camera2.basic.fragments
+package com.example.android.camera2.basic2.fragments
 
 import android.annotation.SuppressLint
 import android.content.Context
@@ -28,6 +28,8 @@ import android.hardware.camera2.CaptureRequest
 import android.hardware.camera2.CaptureResult
 import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
+import android.hardware.camera2.params.OutputConfiguration
+import android.hardware.camera2.params.SessionConfiguration
 import android.media.Image
 import android.media.ImageReader
 import android.os.Build
@@ -51,9 +53,9 @@ import androidx.navigation.fragment.navArgs
 import com.example.android.camera.utils.computeExifOrientation
 import com.example.android.camera.utils.getPreviewOutputSize
 import com.example.android.camera.utils.OrientationLiveData
-import com.example.android.camera2.basic.CameraActivity
-import com.example.android.camera2.basic.R
-import com.example.android.camera2.basic.databinding.FragmentCameraBinding
+import com.example.android.camera2.basic2.CameraActivity
+import com.example.android.camera2.basic2.R
+import com.example.android.camera2.basic2.databinding.FragmentCameraBinding
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
@@ -66,6 +68,8 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.TimeoutException
 import java.util.Date
 import java.util.Locale
+import java.util.concurrent.Executor
+import java.util.concurrent.Executors
 import kotlin.RuntimeException
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -94,7 +98,7 @@ class CameraFragment : Fragment() {
 
     /** [CameraCharacteristics] corresponding to the provided Camera ID */
     private val characteristics: CameraCharacteristics by lazy {
-        cameraManager.getCameraCharacteristics(args.cameraId)
+        cameraManager.getCameraCharacteristics(cameraId)
     }
 
     /** Readers used as buffers for camera still shots */
@@ -104,7 +108,8 @@ class CameraFragment : Fragment() {
     private val cameraThread = HandlerThread("CameraThread").apply { start() }
 
     /** [Handler] corresponding to [cameraThread] */
-    private val cameraHandler = Handler(cameraThread.looper)
+    //private val cameraHandler = Handler(cameraThread.looper)
+    private var cameraExecutor = Executors.newSingleThreadExecutor()
 
     /** Performs recording animation of flashing screen */
     private val animationTask: Runnable by lazy {
@@ -133,6 +138,9 @@ class CameraFragment : Fragment() {
 
     /** Live data listener for changes in the device orientation relative to the camera */
     private lateinit var relativeOrientation: OrientationLiveData
+
+    var cameraId = "0"
+    var pixelFormat = ImageFormat.JPEG
 
     override fun onCreateView(
             inflater: LayoutInflater,
@@ -195,29 +203,39 @@ class CameraFragment : Fragment() {
      * - Starts the preview by dispatching a repeating capture request
      * - Sets up the still image capture listeners
      */
+    @SuppressLint("NewApi")
     private fun initializeCamera() = lifecycleScope.launch(Dispatchers.Main) {
         // Open the selected camera
-        camera = openCamera(cameraManager, args.cameraId, cameraHandler)
+        camera = openCamera(cameraManager, cameraId, cameraExecutor)
 
         // Initialize an image reader which will be used to capture still photos
         val size = characteristics.get(
                 CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-                .getOutputSizes(args.pixelFormat).maxByOrNull { it.height * it.width }!!
+                .getOutputSizes(pixelFormat).maxByOrNull { it.height * it.width }!!
         imageReader = ImageReader.newInstance(
-                size.width, size.height, args.pixelFormat, IMAGE_BUFFER_SIZE)
+                size.width, size.height, pixelFormat, IMAGE_BUFFER_SIZE)
 
         // Creates list of Surfaces where the camera will output frames
         val targets = listOf(fragmentCameraBinding.viewFinder.holder.surface, imageReader.surface)
 
+        //create outputconfigs
+        val outputConfigurations =
+            listOf<OutputConfiguration>(OutputConfiguration(fragmentCameraBinding.viewFinder.holder.surface).apply {
+                setPhysicalCameraId("3")
+            },
+                OutputConfiguration(imageReader.surface).apply {
+                    setPhysicalCameraId("3")
+                })
+
         // Start a capture session using our open camera and list of Surfaces where frames will go
-        session = createCaptureSession(camera, targets, cameraHandler)
+        session = createCaptureSession(camera, outputConfigurations, cameraExecutor)
 
         val captureRequest = camera.createCaptureRequest(
                 CameraDevice.TEMPLATE_PREVIEW).apply { addTarget(fragmentCameraBinding.viewFinder.holder.surface) }
 
         // This will keep sending the capture request as frequently as possible until the
         // session is torn down or session.stopRepeating() is called
-        session.setRepeatingRequest(captureRequest.build(), null, cameraHandler)
+        session.setSingleRepeatingRequest(captureRequest.build(), cameraExecutor, object : CameraCaptureSession.CaptureCallback() {})
 
         // Listen to the capture button
         fragmentCameraBinding.captureButton.setOnClickListener {
@@ -260,13 +278,13 @@ class CameraFragment : Fragment() {
     }
 
     /** Opens the camera and returns the opened device (as the result of the suspend coroutine) */
-    @SuppressLint("MissingPermission")
+    @SuppressLint("MissingPermission", "NewApi")
     private suspend fun openCamera(
             manager: CameraManager,
             cameraId: String,
-            handler: Handler? = null
+            executor: Executor
     ): CameraDevice = suspendCancellableCoroutine { cont ->
-        manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
+        manager.openCamera(cameraId, cameraExecutor, object : CameraDevice.StateCallback() {
             override fun onOpened(device: CameraDevice) = cont.resume(device)
 
             override fun onDisconnected(device: CameraDevice) {
@@ -287,31 +305,38 @@ class CameraFragment : Fragment() {
                 Log.e(TAG, exc.message, exc)
                 if (cont.isActive) cont.resumeWithException(exc)
             }
-        }, handler)
+        })
     }
 
     /**
      * Starts a [CameraCaptureSession] and returns the configured session (as the result of the
      * suspend coroutine
      */
+    @SuppressLint("NewApi")
     private suspend fun createCaptureSession(
             device: CameraDevice,
-            targets: List<Surface>,
-            handler: Handler? = null
+            targets: List<OutputConfiguration>,
+            executor: Executor
     ): CameraCaptureSession = suspendCoroutine { cont ->
 
         // Create a capture session using the predefined targets; this also involves defining the
         // session state callback to be notified of when the session is ready
-        device.createCaptureSession(targets, object : CameraCaptureSession.StateCallback() {
+        val sessionConfiguration = SessionConfiguration(
+            SessionConfiguration.SESSION_REGULAR,
+            targets,
+            executor,
+            object : CameraCaptureSession.StateCallback() {
 
-            override fun onConfigured(session: CameraCaptureSession) = cont.resume(session)
+                override fun onConfigured(session: CameraCaptureSession) = cont.resume(session)
 
-            override fun onConfigureFailed(session: CameraCaptureSession) {
-                val exc = RuntimeException("Camera ${device.id} session configuration failed")
-                Log.e(TAG, exc.message, exc)
-                cont.resumeWithException(exc)
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    val exc = RuntimeException("Camera ${device.id} session configuration failed")
+                    Log.e(TAG, exc.message, exc)
+                    cont.resumeWithException(exc)
+                }
             }
-        }, handler)
+        )
+        device.createCaptureSession(sessionConfiguration)
     }
 
     /**
@@ -319,6 +344,7 @@ class CameraFragment : Fragment() {
      * template. It performs synchronization between the [CaptureResult] and the [Image] resulting
      * from the single capture, and outputs a [CombinedCaptureResult] object.
      */
+    @SuppressLint("NewApi")
     private suspend fun takePhoto():
             CombinedCaptureResult = suspendCoroutine { cont ->
 
@@ -337,7 +363,9 @@ class CameraFragment : Fragment() {
 
         val captureRequest = session.device.createCaptureRequest(
                 CameraDevice.TEMPLATE_STILL_CAPTURE).apply { addTarget(imageReader.surface) }
-        session.capture(captureRequest.build(), object : CameraCaptureSession.CaptureCallback() {
+
+
+        session.captureSingleRequest(captureRequest.build(), cameraExecutor, object : CameraCaptureSession.CaptureCallback() {
 
             override fun onCaptureStarted(
                     session: CameraCaptureSession,
@@ -400,7 +428,7 @@ class CameraFragment : Fragment() {
                     }
                 }
             }
-        }, cameraHandler)
+        })
     }
 
     /** Helper function used to save a [CombinedCaptureResult] into a [File] */
@@ -456,6 +484,7 @@ class CameraFragment : Fragment() {
         super.onDestroy()
         cameraThread.quitSafely()
         imageReaderThread.quitSafely()
+        cameraExecutor.shutdown()
     }
 
     override fun onDestroyView() {
